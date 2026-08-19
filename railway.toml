@@ -1,2 +1,2 @@
 [deploy]
-startCommand = "python validate_groww.py"
+startCommand = "python groww_symbol_to_slug.py"
