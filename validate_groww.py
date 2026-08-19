@@ -1,18 +1,33 @@
+import os
 import csv
 import re
 import time
+import base64
 from pathlib import Path
-from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
+
+# ============================================================
+# CONFIG
+# ============================================================
 
 INPUT_FILE = "groww_slugs.csv"
 OUTPUT_FILE = "groww_slugs_validated.csv"
 
 REQUEST_DELAY = 0.25
 TIMEOUT = 20
+
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+EMAIL_TO = os.getenv("EMAIL_TO")
+
+RESEND_FROM = "onboarding@resend.dev"
+
+
+# ============================================================
+# HTTP SESSION
+# ============================================================
 
 session = requests.Session()
 
@@ -27,6 +42,10 @@ session.headers.update({
 })
 
 
+# ============================================================
+# EXTRACT SLUG FROM FINAL URL
+# ============================================================
+
 def extract_final_slug(url):
 
     match = re.search(
@@ -40,9 +59,18 @@ def extract_final_slug(url):
     return ""
 
 
-def validate_slug(symbol, company_name, slug):
+# ============================================================
+# VALIDATE ONE GROWW SLUG
+# ============================================================
+
+def validate_slug(
+    symbol,
+    company_name,
+    slug
+):
 
     if not slug:
+
         return {
             "symbol": symbol,
             "company_name": company_name,
@@ -79,7 +107,9 @@ def validate_slug(symbol, company_name, slug):
                 "company_name": company_name,
                 "original_slug": slug,
                 "validated_slug": final_slug,
-                "status": f"HTTP_{response.status_code}",
+                "status": (
+                    f"HTTP_{response.status_code}"
+                ),
                 "final_url": final_url,
                 "http_status": response.status_code,
             }
@@ -105,16 +135,11 @@ def validate_slug(symbol, company_name, slug):
             if len(word) >= 4
         ]
 
-        matches = 0
-
-        for word in company_words:
-
-            if word in page_text:
-                matches += 1
-
-        # ----------------------------------------------------
-        # Determine validation status
-        # ----------------------------------------------------
+        matches = sum(
+            1
+            for word in company_words
+            if word in page_text
+        )
 
         if (
             final_slug
@@ -130,7 +155,9 @@ def validate_slug(symbol, company_name, slug):
 
         elif final_slug:
 
-            status = "PAGE_FOUND_NAME_UNCONFIRMED"
+            status = (
+                "PAGE_FOUND_NAME_UNCONFIRMED"
+            )
 
         else:
 
@@ -146,7 +173,7 @@ def validate_slug(symbol, company_name, slug):
             "http_status": response.status_code,
         }
 
-    except requests.RequestException as e:
+    except requests.RequestException:
 
         return {
             "symbol": symbol,
@@ -158,7 +185,7 @@ def validate_slug(symbol, company_name, slug):
             "http_status": "",
         }
 
-    except Exception as e:
+    except Exception:
 
         return {
             "symbol": symbol,
@@ -170,6 +197,206 @@ def validate_slug(symbol, company_name, slug):
             "http_status": "",
         }
 
+
+# ============================================================
+# SEND CSV THROUGH RESEND
+# ============================================================
+
+def send_validation_email(
+    output_file,
+    results
+):
+
+    print()
+    print("Preparing validation email...")
+
+    if not RESEND_API_KEY:
+
+        raise RuntimeError(
+            "RESEND_API_KEY environment variable "
+            "is missing."
+        )
+
+    if not EMAIL_TO:
+
+        raise RuntimeError(
+            "EMAIL_TO environment variable "
+            "is missing."
+        )
+
+    # --------------------------------------------------------
+    # Summary
+    # --------------------------------------------------------
+
+    counts = {}
+
+    for result in results:
+
+        status = result["status"]
+
+        counts[status] = (
+            counts.get(status, 0)
+            + 1
+        )
+
+    valid = counts.get(
+        "VALID",
+        0
+    )
+
+    corrected = counts.get(
+        "CORRECTED",
+        0
+    )
+
+    missing = counts.get(
+        "MISSING",
+        0
+    )
+
+    invalid = counts.get(
+        "INVALID",
+        0
+    )
+
+    unconfirmed = counts.get(
+        "PAGE_FOUND_NAME_UNCONFIRMED",
+        0
+    )
+
+    errors = (
+        counts.get(
+            "REQUEST_ERROR",
+            0
+        )
+        +
+        counts.get(
+            "ERROR",
+            0
+        )
+    )
+
+    # --------------------------------------------------------
+    # Read attachment
+    # --------------------------------------------------------
+
+    with open(
+        output_file,
+        "rb"
+    ) as f:
+
+        encoded = base64.b64encode(
+            f.read()
+        ).decode(
+            "utf-8"
+        )
+
+    # --------------------------------------------------------
+    # Email
+    # --------------------------------------------------------
+
+    payload = {
+
+        "from": RESEND_FROM,
+
+        "to": [
+            EMAIL_TO
+        ],
+
+        "subject": (
+            "Groww Slug Validation "
+            "Completed"
+        ),
+
+        "text": f"""
+Groww Slug Validation Completed
+
+Total mappings:
+{len(results):,}
+
+VALID:
+{valid:,}
+
+CORRECTED:
+{corrected:,}
+
+MISSING:
+{missing:,}
+
+INVALID:
+{invalid:,}
+
+PAGE FOUND / NAME UNCONFIRMED:
+{unconfirmed:,}
+
+REQUEST / OTHER ERRORS:
+{errors:,}
+
+The complete validation CSV is attached.
+
+File:
+groww_slugs_validated.csv
+
+Important:
+VALID and CORRECTED mappings can be considered
+for the daily screener.
+
+PAGE_FOUND_NAME_UNCONFIRMED mappings should be
+reviewed before being used automatically.
+
+Regards,
+NSE F&O Screener
+""",
+
+        "attachments": [
+            {
+                "filename": (
+                    "groww_slugs_validated.csv"
+                ),
+                "content": encoded,
+            }
+        ],
+    }
+
+    response = requests.post(
+        "https://api.resend.com/emails",
+
+        headers={
+            "Authorization":
+                f"Bearer {RESEND_API_KEY}",
+
+            "Content-Type":
+                "application/json",
+        },
+
+        json=payload,
+
+        timeout=60
+    )
+
+    print(
+        f"Resend status: "
+        f"{response.status_code}"
+    )
+
+    if response.status_code >= 400:
+
+        print(
+            response.text
+        )
+
+        raise RuntimeError(
+            "Resend email failed."
+        )
+
+    print(
+        "VALIDATION CSV EMAIL SENT SUCCESSFULLY"
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
 
@@ -187,6 +414,10 @@ def main():
             f"{INPUT_FILE} not found."
         )
 
+    # --------------------------------------------------------
+    # Load CSV
+    # --------------------------------------------------------
+
     with open(
         input_path,
         "r",
@@ -203,30 +434,44 @@ def main():
 
     results = []
 
+    # --------------------------------------------------------
+    # Validate
+    # --------------------------------------------------------
+
     for index, row in enumerate(
         rows,
         start=1
     ):
 
         symbol = (
-            row.get("symbol", "")
+            row.get(
+                "symbol",
+                ""
+            )
             .strip()
             .upper()
         )
 
         company_name = (
-            row.get("company_name", "")
+            row.get(
+                "company_name",
+                ""
+            )
             .strip()
         )
 
         slug = (
-            row.get("groww_slug", "")
+            row.get(
+                "groww_slug",
+                ""
+            )
             .strip()
         )
 
         print(
             f"[{index:,}/{len(rows):,}] "
-            f"{symbol} → {slug}"
+            f"{symbol} → {slug}",
+            flush=True
         )
 
         result = validate_slug(
@@ -235,17 +480,24 @@ def main():
             slug
         )
 
-        results.append(result)
-
-        print(
-            f"    {result['status']}"
+        results.append(
+            result
         )
 
-        if result["validated_slug"]:
+        print(
+            f"    STATUS: "
+            f"{result['status']}",
+            flush=True
+        )
+
+        if result[
+            "validated_slug"
+        ]:
 
             print(
-                f"    Final slug: "
-                f"{result['validated_slug']}"
+                f"    FINAL SLUG: "
+                f"{result['validated_slug']}",
+                flush=True
             )
 
         time.sleep(
@@ -253,7 +505,7 @@ def main():
         )
 
     # --------------------------------------------------------
-    # Write validation report
+    # Save CSV
     # --------------------------------------------------------
 
     fieldnames = [
@@ -284,8 +536,13 @@ def main():
             results
         )
 
+    print()
+    print("=" * 70)
+    print("VALIDATION COMPLETE")
+    print("=" * 70)
+
     # --------------------------------------------------------
-    # Summary
+    # Print summary
     # --------------------------------------------------------
 
     counts = {}
@@ -299,23 +556,33 @@ def main():
             + 1
         )
 
-    print()
-    print("=" * 70)
-    print("VALIDATION COMPLETE")
-    print("=" * 70)
-
     for status, count in sorted(
         counts.items()
     ):
 
         print(
-            f"{status:<35} {count:,}"
+            f"{status:<35} "
+            f"{count:,}"
         )
 
     print()
     print(
-        f"Output: {OUTPUT_FILE}"
+        f"Created: {OUTPUT_FILE}"
     )
+
+    # --------------------------------------------------------
+    # Email
+    # --------------------------------------------------------
+
+    send_validation_email(
+        OUTPUT_FILE,
+        results
+    )
+
+    print()
+    print("=" * 70)
+    print("DONE")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
