@@ -1,2 +1,2 @@
 [deploy]
-startCommand = "python groww_symbol_to_slug.py"
+startCommand = "python groww_search.py"
