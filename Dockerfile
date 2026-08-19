@@ -8,4 +8,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY groww_directory_batches.py .
 
-CMD ["python", "groww_directory_batches.py"]
+CMD ["python", "-u", "groww_directory_batches.py"]
