@@ -3,7 +3,7 @@ import re
 import time
 import base64
 import os
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -16,13 +16,14 @@ from bs4 import BeautifulSoup
 INPUT_FILE = "nse_symbols.csv"
 OUTPUT_FILE = "groww_slugs_validated.csv"
 
-GROWW_STOCKS_LIST = "https://groww.in/stocks/stocks-list"
 GROWW_BASE = "https://groww.in"
 
-REQUEST_DELAY = 0.4
+# Groww website search
+SEARCH_URL = "https://groww.in/search"
+
+REQUEST_DELAY = 0.7
 TIMEOUT = 20
 
-# Railway environment variables
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 EMAIL_TO = os.getenv("EMAIL_TO")
 
@@ -30,7 +31,7 @@ RESEND_FROM = "onboarding@resend.dev"
 
 
 # ============================================================
-# HTTP SESSION
+# SESSION
 # ============================================================
 
 session = requests.Session()
@@ -38,8 +39,7 @@ session = requests.Session()
 session.headers.update({
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 "
-        "(KHTML, like Gecko) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/140.0 Safari/537.36"
     ),
     "Accept-Language": "en-IN,en;q=0.9",
@@ -51,7 +51,7 @@ session.headers.update({
 
 
 # ============================================================
-# EXTRACT SLUG
+# EXTRACT STOCK SLUG
 # ============================================================
 
 def extract_slug(url):
@@ -68,44 +68,142 @@ def extract_slug(url):
 
 
 # ============================================================
-# GET GROWW STOCK DIRECTORY
+# EXTRACT NSE SYMBOL FROM PAGE
 # ============================================================
 
-def get_groww_stock_links():
+def extract_nse_symbol(html):
 
-    print()
-    print("=" * 70)
-    print("LOADING GROWW STOCK DIRECTORY")
-    print("=" * 70)
+    patterns = [
 
-    try:
+        r'"nseSymbol"\s*:\s*"([^"]+)"',
 
-        response = session.get(
-            GROWW_STOCKS_LIST,
-            timeout=TIMEOUT
+        r'"nse_symbol"\s*:\s*"([^"]+)"',
+
+        r'"nse"\s*:\s*"([^"]+)"',
+
+        r'"NSE_SYMBOL"\s*:\s*"([^"]+)"',
+
+        r'"tradingSymbol"\s*:\s*"([^"]+)"',
+
+        r'"trading_symbol"\s*:\s*"([^"]+)"',
+
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            html,
+            re.IGNORECASE
         )
 
-        print(
-            f"Groww response: "
-            f"{response.status_code}"
-        )
+        if match:
 
-        response.raise_for_status()
+            return (
+                match.group(1)
+                .strip()
+                .upper()
+            )
 
-    except Exception as e:
-
-        print(
-            f"ERROR loading Groww: {e}"
-        )
-
-        return []
+    # --------------------------------------------------------
+    # Fallback: visible text
+    # --------------------------------------------------------
 
     soup = BeautifulSoup(
-        response.text,
+        html,
         "lxml"
     )
 
-    stocks = []
+    text = soup.get_text(
+        " ",
+        strip=True
+    )
+
+    patterns = [
+
+        r"NSE\s+symbol\s*[:\-]?\s*"
+        r"([A-Z0-9&.\-]+)",
+
+        r"NSE\s*[:\-]\s*"
+        r"([A-Z0-9&.\-]+)",
+
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            text,
+            re.IGNORECASE
+        )
+
+        if match:
+
+            return (
+                match.group(1)
+                .strip()
+                .upper()
+            )
+
+    return ""
+
+
+# ============================================================
+# EXTRACT COMPANY NAME
+# ============================================================
+
+def extract_company_name(html):
+
+    soup = BeautifulSoup(
+        html,
+        "lxml"
+    )
+
+    # Try title first
+    if soup.title:
+
+        title = soup.title.get_text(
+            " ",
+            strip=True
+        )
+
+        if title:
+
+            # Remove common Groww suffixes
+            title = re.sub(
+                r"\s*[-|]\s*Groww.*$",
+                "",
+                title,
+                flags=re.IGNORECASE
+            )
+
+            return title.strip()
+
+    # Try H1
+    h1 = soup.find("h1")
+
+    if h1:
+
+        return h1.get_text(
+            " ",
+            strip=True
+        )
+
+    return ""
+
+
+# ============================================================
+# FIND STOCK LINKS IN SEARCH RESPONSE
+# ============================================================
+
+def extract_stock_links(html):
+
+    soup = BeautifulSoup(
+        html,
+        "lxml"
+    )
+
+    links = []
 
     for anchor in soup.find_all(
         "a",
@@ -122,162 +220,196 @@ def get_groww_stock_links():
         ):
             continue
 
-        if any(
-            x in href
-            for x in [
-                "/stocks/sectors/",
-                "/stocks/filter",
-                "/stocks/stocks-list"
-            ]
-        ):
+        # Exclude generic pages
+        if href in [
+            "/stocks",
+            "/stocks/",
+            "/stocks/stocks-list",
+            "/stocks/stocks-list/",
+        ]:
             continue
 
-        name = anchor.get_text(
+        text = anchor.get_text(
             " ",
             strip=True
         )
 
-        if not name:
-            continue
+        url = urljoin(
+            GROWW_BASE,
+            href
+        )
 
-        stocks.append({
-            "name": name,
-            "url": urljoin(
-                GROWW_BASE,
-                href
-            )
+        links.append({
+            "url": url,
+            "text": text
         })
 
     # Deduplicate
-
     unique = {}
 
-    for stock in stocks:
+    for item in links:
 
         unique[
-            stock["url"]
-        ] = stock
+            item["url"]
+        ] = item
 
-    stocks = list(
+    return list(
         unique.values()
     )
 
+
+# ============================================================
+# SEARCH GROWW FOR ONE SYMBOL
+# ============================================================
+
+def search_groww(
+    symbol
+):
+
     print(
-        f"Stock links found: "
-        f"{len(stocks):,}"
+        f"Searching Groww for {symbol}...",
+        flush=True
     )
 
-    return stocks
+    # --------------------------------------------------------
+    # Attempt website search
+    # --------------------------------------------------------
 
+    search_urls = [
 
-# ============================================================
-# IDENTIFY NSE SYMBOL FROM GROWW PAGE
-# ============================================================
+        (
+            f"{SEARCH_URL}"
+            f"?q={quote(symbol)}"
+        ),
 
-def identify_stock(stock):
+        (
+            f"{GROWW_BASE}/search/"
+            f"{quote(symbol)}"
+        ),
 
-    try:
+    ]
 
-        response = session.get(
-            stock["url"],
-            timeout=TIMEOUT
-        )
+    candidates = []
 
-        if response.status_code != 200:
-            return None
+    for search_url in search_urls:
 
-        html = response.text
+        try:
 
-        # ----------------------------------------------------
-        # Look for NSE symbol in page source
-        # ----------------------------------------------------
-
-        patterns = [
-            r'"nseSymbol"\s*:\s*"([^"]+)"',
-            r'"nse_symbol"\s*:\s*"([^"]+)"',
-            r'"nse"\s*:\s*"([^"]+)"',
-            r'"NSE_SYMBOL"\s*:\s*"([^"]+)"',
-        ]
-
-        nse_symbol = ""
-
-        for pattern in patterns:
-
-            match = re.search(
-                pattern,
-                html,
-                re.IGNORECASE
+            response = session.get(
+                search_url,
+                timeout=TIMEOUT,
+                allow_redirects=True
             )
 
-            if match:
+            if response.status_code != 200:
+                continue
 
-                nse_symbol = (
-                    match.group(1)
-                    .strip()
-                    .upper()
-                )
+            links = extract_stock_links(
+                response.text
+            )
 
+            candidates.extend(
+                links
+            )
+
+            if candidates:
                 break
 
-        # ----------------------------------------------------
-        # Fallback text search
-        # ----------------------------------------------------
+        except Exception:
 
-        if not nse_symbol:
+            continue
 
-            text = BeautifulSoup(
-                html,
-                "lxml"
-            ).get_text(
-                " ",
-                strip=True
-            )
+    # Deduplicate candidates
 
-            match = re.search(
-                r"NSE\s*(?:symbol|code)"
-                r"\s*[:\-]?\s*"
-                r"([A-Z0-9&.\-]+)",
-                text,
-                re.IGNORECASE
-            )
+    unique = {}
 
-            if match:
+    for candidate in candidates:
 
-                nse_symbol = (
-                    match.group(1)
-                    .strip()
-                    .upper()
-                )
+        unique[
+            candidate["url"]
+        ] = candidate
 
-        if not nse_symbol:
-            return None
+    candidates = list(
+        unique.values()
+    )
 
-        return {
-            "nse_symbol": nse_symbol,
-            "groww_company": stock["name"],
-            "groww_url": stock["url"],
-            "groww_slug": extract_slug(
-                stock["url"]
-            )
-        }
-
-    except Exception:
+    if not candidates:
 
         return None
 
+    print(
+        f"  Search candidates: "
+        f"{len(candidates)}",
+        flush=True
+    )
+
+    # --------------------------------------------------------
+    # Check each candidate
+    # --------------------------------------------------------
+
+    for candidate in candidates:
+
+        url = candidate["url"]
+
+        try:
+
+            response = session.get(
+                url,
+                timeout=TIMEOUT
+            )
+
+            if response.status_code != 200:
+                continue
+
+            html = response.text
+
+            page_symbol = (
+                extract_nse_symbol(
+                    html
+                )
+            )
+
+            if page_symbol != symbol:
+                continue
+
+            company_name = (
+                extract_company_name(
+                    html
+                )
+            )
+
+            slug = extract_slug(
+                response.url
+            )
+
+            if not slug:
+                continue
+
+            return {
+                "symbol": symbol,
+                "groww_company":
+                    company_name,
+                "groww_slug":
+                    slug,
+                "groww_url":
+                    response.url,
+            }
+
+        except Exception:
+
+            continue
+
+    return None
+
 
 # ============================================================
-# VERIFY MARKET NEWS PAGE
+# VERIFY MARKET NEWS
 # ============================================================
 
-def verify_market_news(slug):
-
-    if not slug:
-
-        return {
-            "status": "NO_SLUG",
-            "url": ""
-        }
+def verify_market_news(
+    slug,
+    symbol
+):
 
     url = (
         f"{GROWW_BASE}/stocks/"
@@ -292,19 +424,35 @@ def verify_market_news(slug):
             allow_redirects=True
         )
 
-        final_url = response.url
-
         if response.status_code != 200:
 
             return {
                 "status":
                     f"NEWS_HTTP_{response.status_code}",
                 "url":
-                    final_url
+                    response.url
+            }
+
+        # Verify the redirected page still
+        # corresponds to the requested stock.
+        page_symbol = extract_nse_symbol(
+            response.text
+        )
+
+        if (
+            page_symbol
+            and page_symbol != symbol
+        ):
+
+            return {
+                "status":
+                    "NEWS_SYMBOL_MISMATCH",
+                "url":
+                    response.url
             }
 
         final_slug = extract_slug(
-            final_url
+            response.url
         )
 
         if not final_slug:
@@ -313,83 +461,76 @@ def verify_market_news(slug):
                 "status":
                     "NEWS_SLUG_NOT_FOUND",
                 "url":
-                    final_url
+                    response.url
             }
 
         return {
-            "status": "VALID",
-            "url": final_url
+            "status":
+                "VALID",
+            "url":
+                response.url
         }
 
     except Exception:
 
         return {
-            "status": "NEWS_REQUEST_ERROR",
-            "url": url
+            "status":
+                "NEWS_REQUEST_ERROR",
+            "url":
+                url
         }
 
 
 # ============================================================
-# SEND CSV BY RESEND
+# EMAIL CSV
 # ============================================================
 
-def email_csv(
+def send_email(
     filename,
     results
 ):
 
     print()
     print("=" * 70)
-    print("EMAILING VALIDATION REPORT")
+    print("SENDING VALIDATION REPORT")
     print("=" * 70)
 
     if not RESEND_API_KEY:
 
         raise RuntimeError(
-            "RESEND_API_KEY is missing "
-            "from Railway Variables."
+            "RESEND_API_KEY is not configured."
         )
 
     if not EMAIL_TO:
 
         raise RuntimeError(
-            "EMAIL_TO is missing "
-            "from Railway Variables."
+            "EMAIL_TO is not configured."
         )
 
     # --------------------------------------------------------
-    # Count statuses
+    # Summary
     # --------------------------------------------------------
 
-    counts = {}
-
-    for result in results:
-
-        status = result["status"]
-
-        counts[status] = (
-            counts.get(status, 0) + 1
-        )
-
-    valid = counts.get(
-        "VALID",
-        0
+    valid = sum(
+        1
+        for row in results
+        if row["status"] == "VALID"
     )
 
-    not_found = counts.get(
-        "NOT_FOUND",
-        0
+    not_found = sum(
+        1
+        for row in results
+        if row["status"] == "NOT_FOUND"
     )
 
-    news_failed = sum(
-        count
-        for status, count
-        in counts.items()
-        if status.startswith("NEWS_")
+    other = (
+        len(results)
+        - valid
+        - not_found
     )
 
     # --------------------------------------------------------
-    # Encode attachment
+    # Encode CSV
     # --------------------------------------------------------
 
     with open(
@@ -399,10 +540,12 @@ def email_csv(
 
         encoded = base64.b64encode(
             f.read()
-        ).decode("utf-8")
+        ).decode(
+            "utf-8"
+        )
 
     # --------------------------------------------------------
-    # Email body
+    # Email
     # --------------------------------------------------------
 
     body = f"""
@@ -411,44 +554,47 @@ Groww NSE Symbol → Slug Validation Complete
 Total NSE symbols:
 {len(results):,}
 
-Valid Groww mappings:
+VALID:
 {valid:,}
 
-Not found:
+NOT FOUND:
 {not_found:,}
 
-Market-news verification failures:
-{news_failed:,}
+OTHER:
+{other:,}
 
-The complete CSV is attached.
-
-The CSV contains:
+The attached CSV contains:
 
 - NSE symbol
 - Groww company name
-- Groww slug
+- Actual Groww slug
 - Groww stock URL
 - Groww Market News URL
 - Validation status
+
+The script searched Groww for each NSE symbol and
+then verified the corresponding Market News page.
 
 Regards,
 NSE F&O Screener
 """
 
     payload = {
-        "from": RESEND_FROM,
 
-        "to": [
-            EMAIL_TO
-        ],
+        "from":
+            RESEND_FROM,
+
+        "to":
+            [EMAIL_TO],
 
         "subject":
-            "Groww Slug Validation Report",
+            "Groww Slug Validation - Completed",
 
         "text":
             body,
 
         "attachments": [
+
             {
                 "filename":
                     "groww_slugs_validated.csv",
@@ -456,32 +602,28 @@ NSE F&O Screener
                 "content":
                     encoded
             }
+
         ]
     }
 
-    try:
+    response = requests.post(
 
-        response = requests.post(
-            "https://api.resend.com/emails",
+        "https://api.resend.com/emails",
 
-            headers={
-                "Authorization":
-                    f"Bearer {RESEND_API_KEY}",
+        headers={
 
-                "Content-Type":
-                    "application/json"
-            },
+            "Authorization":
+                f"Bearer {RESEND_API_KEY}",
 
-            json=payload,
+            "Content-Type":
+                "application/json"
 
-            timeout=60
-        )
+        },
 
-    except Exception as e:
+        json=payload,
 
-        raise RuntimeError(
-            f"Resend request failed: {e}"
-        )
+        timeout=60
+    )
 
     print(
         f"Resend status: "
@@ -526,7 +668,8 @@ def main():
         )
 
     # --------------------------------------------------------
-    # Load symbols
+    # Read your actual CSV
+    # Column is "symbols"
     # --------------------------------------------------------
 
     with open(
@@ -543,7 +686,7 @@ def main():
 
             symbol = (
                 row.get(
-                    "symbol",
+                    "symbols",
                     ""
                 )
                 .strip()
@@ -556,93 +699,20 @@ def main():
                     symbol
                 )
 
-    print(
-        f"Loaded "
-        f"{len(symbols):,} NSE symbols"
-    )
-
-    target_symbols = set(
-        symbols
-    )
-
-    # --------------------------------------------------------
-    # Load Groww directory
-    # --------------------------------------------------------
-
-    stocks = get_groww_stock_links()
-
-    if not stocks:
-
-        raise RuntimeError(
-            "Could not load Groww stock directory."
+    # Remove duplicates
+    symbols = list(
+        dict.fromkeys(
+            symbols
         )
-
-    # --------------------------------------------------------
-    # Build Groww mapping
-    # --------------------------------------------------------
-
-    print()
-    print(
-        "SEARCHING GROWW STOCKS..."
     )
 
-    mapping = {}
-
-    for index, stock in enumerate(
-        stocks,
-        start=1
-    ):
-
-        result = identify_stock(
-            stock
-        )
-
-        if result:
-
-            symbol = result[
-                "nse_symbol"
-            ]
-
-            if symbol in target_symbols:
-
-                mapping[
-                    symbol
-                ] = result
-
-                print(
-                    f"[MATCH] "
-                    f"{symbol} → "
-                    f"{result['groww_slug']}",
-                    flush=True
-                )
-
-        if index % 100 == 0:
-
-            print(
-                f"Processed "
-                f"{index:,}/"
-                f"{len(stocks):,}",
-                flush=True
-            )
-
-        time.sleep(
-            REQUEST_DELAY
-        )
-
-    print()
     print(
-        f"Groww matches found: "
-        f"{len(mapping):,}"
+        f"Loaded {len(symbols):,} NSE symbols"
     )
 
     # --------------------------------------------------------
-    # Verify Market News
+    # Search every NSE symbol
     # --------------------------------------------------------
-
-    print()
-    print(
-        "VERIFYING MARKET NEWS LINKS..."
-    )
 
     results = []
 
@@ -651,7 +721,12 @@ def main():
         start=1
     ):
 
-        stock = mapping.get(
+        print()
+        print(
+            f"[{index}/{len(symbols)}]"
+        )
+
+        stock = search_groww(
             symbol
         )
 
@@ -660,6 +735,11 @@ def main():
         # ----------------------------------------------------
 
         if not stock:
+
+            print(
+                f"  NOT FOUND: {symbol}",
+                flush=True
+            )
 
             results.append({
 
@@ -680,25 +760,40 @@ def main():
 
                 "status":
                     "NOT_FOUND"
+
             })
 
-            print(
-                f"[{index:,}/"
-                f"{len(symbols):,}] "
-                f"{symbol} → NOT_FOUND",
-                flush=True
+            time.sleep(
+                REQUEST_DELAY
             )
 
             continue
 
+        print(
+            f"  MATCH: "
+            f"{stock['groww_company']}",
+            flush=True
+        )
+
+        print(
+            f"  SLUG: "
+            f"{stock['groww_slug']}",
+            flush=True
+        )
+
         # ----------------------------------------------------
-        # Verify news
+        # Verify Market News
         # ----------------------------------------------------
 
         news = verify_market_news(
-            stock[
-                "groww_slug"
-            ]
+            stock["groww_slug"],
+            symbol
+        )
+
+        print(
+            f"  MARKET NEWS: "
+            f"{news['status']}",
+            flush=True
         )
 
         results.append({
@@ -732,42 +827,48 @@ def main():
                 ]
         })
 
-        print(
-            f"[{index:,}/"
-            f"{len(symbols):,}] "
-            f"{symbol} → "
-            f"{stock['groww_slug']} → "
-            f"{news['status']}",
-            flush=True
-        )
-
         time.sleep(
             REQUEST_DELAY
         )
 
     # --------------------------------------------------------
-    # Save CSV
+    # Write output
     # --------------------------------------------------------
 
     fields = [
+
         "symbol",
+
         "groww_company",
+
         "groww_slug",
+
         "groww_url",
+
         "market_news_url",
+
         "status"
+
     ]
 
     with open(
+
         OUTPUT_FILE,
+
         "w",
+
         newline="",
+
         encoding="utf-8-sig"
+
     ) as f:
 
         writer = csv.DictWriter(
+
             f,
+
             fieldnames=fields
+
         )
 
         writer.writeheader()
@@ -776,43 +877,47 @@ def main():
             results
         )
 
-    print()
-    print("=" * 70)
-    print("VALIDATION COMPLETE")
-    print("=" * 70)
-
     # --------------------------------------------------------
     # Summary
     # --------------------------------------------------------
 
     valid = sum(
         1
-        for r in results
-        if r["status"] == "VALID"
+        for row in results
+        if row["status"] == "VALID"
     )
 
     not_found = sum(
         1
-        for r in results
-        if r["status"] == "NOT_FOUND"
+        for row in results
+        if row["status"] == "NOT_FOUND"
     )
 
-    failed = len(results) - valid - not_found
+    other = (
+        len(results)
+        - valid
+        - not_found
+    )
+
+    print()
+    print("=" * 70)
+    print("VALIDATION COMPLETE")
+    print("=" * 70)
 
     print(
-        f"Total:       {len(results):,}"
+        f"Total:     {len(results):,}"
     )
 
     print(
-        f"VALID:       {valid:,}"
+        f"VALID:     {valid:,}"
     )
 
     print(
-        f"NOT FOUND:   {not_found:,}"
+        f"NOT FOUND: {not_found:,}"
     )
 
     print(
-        f"OTHER:       {failed:,}"
+        f"OTHER:     {other:,}"
     )
 
     print()
@@ -824,16 +929,17 @@ def main():
     # Email
     # --------------------------------------------------------
 
-    email_csv(
+    send_email(
         OUTPUT_FILE,
         results
     )
 
     print()
     print("=" * 70)
-    print("PROCESS COMPLETED")
+    print("ALL DONE")
     print("=" * 70)
 
 
 if __name__ == "__main__":
+
     main()
