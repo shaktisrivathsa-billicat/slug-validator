@@ -1,2 +1,0 @@
-[deploy]
-startCommand = "python groww_search.py"
